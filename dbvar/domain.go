@@ -2,14 +2,15 @@ package dbvar
 
 import (
 	"context"
-	"net/url"
+	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes dbvar as a kit Domain: a driver that a multi-domain
+// domain.go exposes dbVar as a kit Domain: a driver that a multi-domain
 // host (ant) enables with a single blank import,
 //
 //	import _ "github.com/tamnd/dbvar-cli/dbvar"
@@ -19,59 +20,53 @@ import (
 // dbvar:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone dbvar binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the dbvar driver. It carries no state; the per-run client is
+// Domain is the dbVar driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "dbvar",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "dbvar",
-			Short:  "A command line for dbvar.",
-			Long: `A command line for dbvar.
+			Short:  "A command line for NCBI dbVar structural variants.",
+			Long: `A command line for NCBI dbVar.
 
-dbvar reads public dbvar data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+dbvar reads structural variation records from the NCBI dbVar database,
+which archives genomic structural variants (deletions, duplications,
+inversions, insertions) across studies and individual variant calls.
+No API key required. 3.2M+ records indexed.`,
+			Site: "https://www.ncbi.nlm.nih.gov/dbvar/",
 			Repo: "https://github.com/tamnd/dbvar-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `dbvar page` and
-	// `ant get dbvar://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search dbVar records by term, variant type, or organism (--limit, --start)",
+		Args:    []kit.Arg{{Name: "query", Help: "search query (e.g. deletion, nstd229, human)"}}}, searchRecords)
 
-	// List op: members of a page, the home of `dbvar links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// dbvar://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "record", Group: "read", Single: true,
+		Summary: "Get a single record by numeric UID", URIType: "record", Resolver: true,
+		Args: []kit.Arg{{Name: "uid", Help: "dbVar numeric UID"}}}, getRecord)
+
+	kit.Handle(app, kit.OpMeta{Name: "study", Group: "read", List: true,
+		Summary: "Search for study records (--limit, --start)",
+		Args:    []kit.Arg{{Name: "term", Help: "study search term (e.g. nstd229, deletion, human)"}}}, searchStudies)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the dbVar client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +77,104 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query  string  `kit:"arg"          help:"search query"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Start  int     `kit:"flag"         help:"offset for pagination"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type recordInput struct {
+	UID    string  `kit:"arg"    help:"dbVar numeric UID"`
+	Client *Client `kit:"inject"`
+}
+
+type studyInput struct {
+	Term   string  `kit:"arg"          help:"study search term"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Start  int     `kit:"flag"         help:"offset for pagination"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
+func searchRecords(ctx context.Context, in searchInput, emit func(*Record) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+	records, _, err := in.Client.SearchAndFetch(ctx, in.Query, limit, in.Start)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, r := range records {
+		if err := emit(r); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full dbvar.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized dbvar reference: %q", input)
+func getRecord(ctx context.Context, in recordInput, emit func(*Record) error) error {
+	r, err := in.Client.GetRecord(ctx, in.UID)
+	if err != nil {
+		return err
 	}
-	return "page", id, nil
+	return emit(r)
+}
+
+func searchStudies(ctx context.Context, in studyInput, emit func(*Record) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	// Filter to STUDY object type using eUtils field qualifier.
+	query := fmt.Sprintf("%s AND STUDY[obj_type]", in.Term)
+	records, _, err := in.Client.SearchAndFetch(ctx, query, limit, in.Start)
+	if err != nil {
+		return err
+	}
+	for _, r := range records {
+		if err := emit(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Classify turns any accepted input into the canonical (type, id).
+// dbVar numeric UIDs are all digits.
+func (Domain) Classify(input string) (string, string, error) {
+	s := strings.TrimSpace(input)
+	if len(s) > 0 && allDigits(s) {
+		return "record", s, nil
+	}
+	return "", "", errs.Usage("dbvar UIDs are numeric, got %q", input)
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("dbvar has no resource type %q", uriType)
+func (Domain) Locate(t, id string) (string, error) {
+	switch t {
+	case "record":
+		return fmt.Sprintf("https://www.ncbi.nlm.nih.gov/dbvar/?term=%s", id), nil
+	default:
+		return "", errs.Usage("dbvar has no resource type %q", t)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+// allDigits reports whether s is a non-empty string of ASCII digits.
+func allDigits(s string) bool {
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
+		}
 	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+	return true
 }
