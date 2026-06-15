@@ -1,200 +1,283 @@
 // Package dbvar is the library behind the dbvar command line:
-// the HTTP client, request shaping, and the typed data models for dbvar.
+// the HTTP client, request shaping, and the typed data models for NCBI dbVar.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that the eUtils API throws under load.
 package dbvar
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"regexp"
+	"net/url"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to dbvar. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "dbvar/dev (+https://github.com/tamnd/dbvar-cli)"
+// Host is the eUtils hostname this client talks to, and the host the URI
+// driver in domain.go claims.
+const Host = "eutils.ncbi.nlm.nih.gov"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at dbvar.com; change it once you
-// know the real endpoints you want to read.
-const Host = "dbvar.com"
+const baseURL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to dbvar over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds the runtime settings for the dbVar client.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+}
 
+// DefaultConfig returns a Config with sensible defaults: 400ms rate limit,
+// 3 retries, and a 30s timeout.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   baseURL,
+		Rate:      400 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
+		UserAgent: "dbvar-cli/0.1.0 (github.com/tamnd/dbvar-cli)",
+	}
+}
+
+// Client talks to NCBI eUtils for dbVar records.
+type Client struct {
+	cfg  Config
+	http *http.Client
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
+// NewClient returns a Client using the given Config.
+func NewClient(cfg Config) *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
-			}
+func (c *Client) wait() {
+	if c.cfg.Rate > 0 {
+		if since := time.Since(c.last); since < c.cfg.Rate {
+			time.Sleep(c.cfg.Rate - since)
 		}
-		body, retry, err := c.do(ctx, url)
-		if err == nil {
-			return body, nil
-		}
-		lastErr = err
-		if !retry {
-			return nil, err
-		}
-	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
-}
-
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
-	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, false, err
-	}
-	req.Header.Set("User-Agent", c.UserAgent)
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, true, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
-	}
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
-}
-
-// pace blocks until at least Rate has passed since the previous request.
-func (c *Client) pace() {
-	if c.Rate <= 0 {
-		return
-	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
-		time.Sleep(wait)
 	}
 	c.last = time.Now()
 }
 
-func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on dbvar.com. It is a stand-in for the typed records you
-// will model from the real dbvar endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `dbvar cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
+func (c *Client) get(ctx context.Context, rawURL string, out any) error {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		if attempt > 0 {
+			d := time.Duration(attempt) * 500 * time.Millisecond
+			if d > 5*time.Second {
+				d = 5 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(d):
+			}
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
+		c.wait()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return err
 		}
+		req.Header.Set("User-Agent", c.cfg.UserAgent)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		return json.NewDecoder(resp.Body).Decode(out)
 	}
-	return out, nil
+	return fmt.Errorf("all retries exhausted")
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
+// --- wire types (unexported) ---
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
+type wireSearch struct {
+	ESearchResult struct {
+		Count  string   `json:"count"`
+		IDList []string `json:"idlist"`
+	} `json:"esearchresult"`
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+type wirePublication struct {
+	PMID            int    `json:"pmid"`
+	PublicationName string `json:"publication_name"`
+}
+
+type wireOrg struct {
+	TaxID   int    `json:"tax_id"`
+	Species string `json:"species"`
+}
+
+type wireRecord struct {
+	UID          string           `json:"uid"`
+	ObjType      string           `json:"obj_type"`
+	St           string           `json:"st"`  // study accession (nstd...)
+	Sv           string           `json:"sv"`  // variant accession (nsv...)
+	StudyType    string           `json:"study_type"`
+	VariantCount int              `json:"variant_count"`
+	Organism     string           `json:"organism"`
+	TaxID        string           `json:"tax_id"`
+	Publications []wirePublication `json:"dbvarpublicationlist"`
+	Orgs         []wireOrg        `json:"dbvarstudyorglist"`
+	Assemblies   []string         `json:"dbvarsubmittedassemblylist"`
+	VariantTypes []string         `json:"dbvarvarianttypelist"`
+	ClinSig      []string         `json:"dbvarclinicalsignificancelist"`
+}
+
+type wireSummary struct {
+	Result map[string]json.RawMessage `json:"result"`
+}
+
+// --- public types ---
+
+// Record is a single dbVar record, either a study (Type=="STUDY") or a
+// structural variant (Type=="VARIANT").
+type Record struct {
+	ID               string   `json:"id"                          kit:"id"`
+	Type             string   `json:"type"`
+	StudyAccession   string   `json:"study_accession,omitempty"`
+	VariantAccession string   `json:"variant_accession,omitempty"`
+	StudyType        string   `json:"study_type,omitempty"`
+	VariantCount     int      `json:"variant_count,omitempty"`
+	Organism         string   `json:"organism,omitempty"`
+	Assemblies       []string `json:"assemblies,omitempty"`
+	VariantTypes     []string `json:"variant_types,omitempty"`
+	ClinSig          []string `json:"clinical_significance,omitempty"`
+	Publications     []string `json:"publications,omitempty"` // "Author Year" from publication_name
+}
+
+func toRecord(w wireRecord) *Record {
+	var pubs []string
+	for _, p := range w.Publications {
+		if p.PublicationName != "" {
+			pubs = append(pubs, p.PublicationName)
+		}
+	}
+
+	// organism: prefer the org list species, fall back to organism field
+	organism := w.Organism
+	if organism == "" && len(w.Orgs) > 0 {
+		organism = w.Orgs[0].Species
+	}
+
+	// study_accession is always the St field; variant_accession is only set for VARIANTs
+	r := &Record{
+		ID:             w.UID,
+		Type:           w.ObjType,
+		StudyAccession: w.St,
+		StudyType:      w.StudyType,
+		VariantCount:   w.VariantCount,
+		Organism:       organism,
+		Assemblies:     nilIfEmpty(w.Assemblies),
+		VariantTypes:   nilIfEmpty(w.VariantTypes),
+		ClinSig:        nilIfEmpty(w.ClinSig),
+		Publications:   nilIfEmpty(pubs),
+	}
+	if w.ObjType == "VARIANT" {
+		r.VariantAccession = w.Sv
+	}
+	return r
+}
+
+func nilIfEmpty(s []string) []string {
+	if len(s) == 0 {
+		return nil
 	}
 	return s
+}
+
+// Search searches dbVar for records matching the query and returns IDs and
+// the total hit count.
+func (c *Client) Search(ctx context.Context, query string, limit, start int) ([]string, int, error) {
+	u := fmt.Sprintf("%s/esearch.fcgi?db=dbvar&term=%s&retmax=%d&retstart=%d&retmode=json",
+		c.cfg.BaseURL, url.QueryEscape(query), limit, start)
+	var w wireSearch
+	if err := c.get(ctx, u, &w); err != nil {
+		return nil, 0, err
+	}
+	count := 0
+	fmt.Sscanf(w.ESearchResult.Count, "%d", &count)
+	return w.ESearchResult.IDList, count, nil
+}
+
+// FetchRecords fetches record details for the given IDs (up to ~500 per
+// call; callers should batch if needed).
+func (c *Client) FetchRecords(ctx context.Context, ids []string) ([]*Record, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	u := fmt.Sprintf("%s/esummary.fcgi?db=dbvar&id=%s&retmode=json",
+		c.cfg.BaseURL, strings.Join(ids, ","))
+	var w wireSummary
+	if err := c.get(ctx, u, &w); err != nil {
+		return nil, err
+	}
+	rawUIDs, ok := w.Result["uids"]
+	if !ok {
+		return nil, fmt.Errorf("no uids in esummary response")
+	}
+	var uids []string
+	if err := json.Unmarshal(rawUIDs, &uids); err != nil {
+		return nil, err
+	}
+	var records []*Record
+	for _, uid := range uids {
+		raw, ok := w.Result[uid]
+		if !ok {
+			continue
+		}
+		var wr wireRecord
+		if err := json.Unmarshal(raw, &wr); err != nil {
+			continue
+		}
+		records = append(records, toRecord(wr))
+	}
+	return records, nil
+}
+
+// GetRecord fetches a single dbVar record by its numeric UID.
+func (c *Client) GetRecord(ctx context.Context, uid string) (*Record, error) {
+	records, err := c.FetchRecords(ctx, []string{uid})
+	if err != nil {
+		return nil, err
+	}
+	if len(records) == 0 {
+		return nil, fmt.Errorf("record %s not found", uid)
+	}
+	return records[0], nil
+}
+
+// SearchAndFetch searches dbVar and returns full Record objects.
+func (c *Client) SearchAndFetch(ctx context.Context, query string, limit, start int) ([]*Record, int, error) {
+	ids, total, err := c.Search(ctx, query, limit, start)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(ids) == 0 {
+		return nil, total, nil
+	}
+	records, err := c.FetchRecords(ctx, ids)
+	if err != nil {
+		return nil, 0, err
+	}
+	return records, total, nil
 }
